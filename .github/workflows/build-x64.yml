@@ -21,7 +21,7 @@ env:
 
 jobs:
   build:
-    runs-on: windows-2025-vs2026   # ships VS 2022 17.13+, Win SDK 26100, .NET 10
+    runs-on: windows-2025-vs2026
 
     steps:
 
@@ -39,26 +39,32 @@ jobs:
     - name: Setup .NET 10
       uses: actions/setup-dotnet@v4
       with:
-        global-json-file: global.json   # pins to sdk 10.0.102
+        global-json-file: global.json
 
-    # ── 3. Patch manifest (dev placeholders → stub values) ───────────────────
-    #   The Configure-AppxManifest script replaces secret placeholders in .cs
-    #   files and sets the publisher identity.  For a local/dev build we pass
-    #   a simple CN= string and leave API keys empty so the app compiles.
-    - name: Configure manifest for dev build
+    # ── 3. Patch secret placeholders in source ────────────────────────────────
+    # The CD workflows use Configure-AppxManifest.ps1 to inject real API keys
+    # and switch tile assets for Preview/Stable builds. For a dev build we
+    # skip that script entirely — the manifest already targets Dev and the Dev
+    # tile assets are committed to the repo. We only need to replace the
+    # compile-time secret placeholder strings so the build doesn't fail.
+    - name: Patch secret placeholders
       shell: pwsh
       run: |
-        . './.github/scripts/Configure-AppxManifest.ps1' `
-          -Branch            "" `
-          -PackageManifestPath "$env:PACKAGE_MANIFEST_PATH" `
-          -Publisher         "CN=FilesDev" `
-          -WorkingDir        "$env:WORKING_DIR" `
-          -SecretBingMapsKey "" `
-          -SecretSentry      "" `
-          -SecretGitHubOAuthClientId ""
+        $files = Get-ChildItem $env:WORKING_DIR -Include *.cs -Recurse
+        foreach ($file in $files) {
+          $content = Get-Content $file -Raw
+          $patched = $content `
+            -replace "cd_app_env_placeholder", "Dev" `
+            -replace "bingmapskey\.secret", "" `
+            -replace "sentry\.secret", "" `
+            -replace "githubclientid\.secret", ""
+          if ($patched -ne $content) {
+            Set-Content $file $patched -NoNewline
+          }
+        }
 
     # ── 4. Restore ───────────────────────────────────────────────────────────
-    - name: Restore solution (NuGet + SDK workloads)
+    - name: Restore solution
       shell: pwsh
       run: |
         msbuild $env:SOLUTION_PATH `
@@ -110,7 +116,7 @@ jobs:
           -p:PackageCertificateThumbprint="" `
           -v:quiet
 
-    # ── 8. Remove empty files (some tooling creates 0-byte stubs) ───────────
+    # ── 8. Remove empty files ────────────────────────────────────────────────
     - name: Remove empty files
       shell: bash
       run: find "$ARTIFACTS_DIR" -empty -delete
