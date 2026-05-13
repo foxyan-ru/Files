@@ -1,0 +1,124 @@
+# Simple one-shot build for Files – produces a self-signed x64 MSIX package.
+# No Azure signing, no Cloudflare, no external secrets required.
+# Trigger manually from Actions > "Build Files x64" > Run workflow.
+
+name: Build Files x64
+
+on:
+  workflow_dispatch:
+
+env:
+  WORKING_DIR:            ${{ github.workspace }}
+  SOLUTION_PATH:          ${{ github.workspace }}\Files.slnx
+  APP_PROJECT_PATH:       ${{ github.workspace }}\src\Files.App\Files.App.csproj
+  LAUNCHER_PROJECT_PATH:  src\Files.App.Launcher\Files.App.Launcher.vcxproj
+  PACKAGE_MANIFEST_PATH:  src\Files.App\Package.appxmanifest
+  ARTIFACTS_DIR:          ${{ github.workspace }}\artifacts
+  APPX_PACKAGE_DIR:       ${{ github.workspace }}\artifacts\AppxPackages\
+  CERT_PATH:              ${{ github.workspace }}\FilesApp_SelfSigned.pfx
+  PLATFORM:               x64
+  CONFIGURATION:          Release
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026   # ships VS 2022 17.13+, Win SDK 26100, .NET 10
+
+    steps:
+
+    # ── 1. Source ────────────────────────────────────────────────────────────
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # ── 2. Toolchain ─────────────────────────────────────────────────────────
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Setup NuGet
+      uses: NuGet/setup-nuget@v2
+
+    - name: Setup .NET 10
+      uses: actions/setup-dotnet@v4
+      with:
+        global-json-file: global.json   # pins to sdk 10.0.102
+
+    # ── 3. Patch manifest (dev placeholders → stub values) ───────────────────
+    #   The Configure-AppxManifest script replaces secret placeholders in .cs
+    #   files and sets the publisher identity.  For a local/dev build we pass
+    #   a simple CN= string and leave API keys empty so the app compiles.
+    - name: Configure manifest for dev build
+      shell: pwsh
+      run: |
+        . './.github/scripts/Configure-AppxManifest.ps1' `
+          -Branch            "" `
+          -PackageManifestPath "$env:PACKAGE_MANIFEST_PATH" `
+          -Publisher         "CN=FilesDev" `
+          -WorkingDir        "$env:WORKING_DIR" `
+          -SecretBingMapsKey "" `
+          -SecretSentry      "" `
+          -SecretGitHubOAuthClientId ""
+
+    # ── 4. Restore ───────────────────────────────────────────────────────────
+    - name: Restore solution (NuGet + SDK workloads)
+      shell: pwsh
+      run: |
+        msbuild $env:SOLUTION_PATH `
+          -t:Restore `
+          -p:Platform=$env:PLATFORM `
+          -p:Configuration=$env:CONFIGURATION `
+          -p:PublishReadyToRun=true `
+          -v:quiet
+
+    - name: Restore NuGet for Launcher (vcxproj)
+      shell: pwsh
+      run: |
+        nuget restore "$env:LAUNCHER_PROJECT_PATH" `
+          -SolutionDirectory "$env:WORKING_DIR" `
+          -Verbosity quiet
+
+    # ── 5. Build C++ launcher ────────────────────────────────────────────────
+    - name: Build launcher
+      shell: pwsh
+      run: |
+        msbuild "$env:LAUNCHER_PROJECT_PATH" `
+          -t:Build `
+          -p:Platform=$env:PLATFORM `
+          -p:Configuration=$env:CONFIGURATION `
+          -v:quiet
+
+    # ── 6. Self-signed certificate ───────────────────────────────────────────
+    - name: Generate self-signed certificate
+      shell: pwsh
+      run: |
+        ./.github/scripts/Generate-SelfCertPfx.ps1 -Destination "$env:CERT_PATH"
+
+    # ── 7. Build & package ───────────────────────────────────────────────────
+    - name: Build and package Files (x64 MSIX)
+      shell: pwsh
+      run: |
+        msbuild "$env:APP_PROJECT_PATH" `
+          -t:Build `
+          -p:Platform=$env:PLATFORM `
+          -p:Configuration=$env:CONFIGURATION `
+          -p:AppxBundlePlatforms=$env:PLATFORM `
+          -p:AppxBundle=Always `
+          -p:GenerateAppxPackageOnBuild=true `
+          -p:UapAppxPackageBuildMode=SideloadOnly `
+          -p:AppxPackageDir="$env:APPX_PACKAGE_DIR" `
+          -p:AppxPackageSigningEnabled=true `
+          -p:PackageCertificateKeyFile="$env:CERT_PATH" `
+          -p:PackageCertificatePassword="" `
+          -p:PackageCertificateThumbprint="" `
+          -v:quiet
+
+    # ── 8. Remove empty files (some tooling creates 0-byte stubs) ───────────
+    - name: Remove empty files
+      shell: bash
+      run: find "$ARTIFACTS_DIR" -empty -delete
+
+    # ── 9. Upload artifact ───────────────────────────────────────────────────
+    - name: Upload MSIX packages
+      uses: actions/upload-artifact@v4
+      with:
+        name: Files-x64-${{ github.sha }}
+        path: ${{ env.ARTIFACTS_DIR }}
+        retention-days: 14
